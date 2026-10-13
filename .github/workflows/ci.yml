@@ -4,12 +4,33 @@ on:
   pull_request:
     branches:
       - production
+    paths-ignore:
+      - ".flue/**"
+      - ".github/workflows/flue-ci.yml"
+      - ".github/workflows/flue-deploy.yml"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  typos:
+    name: Typos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 1
+
+      - name: Check for typos
+        uses: crate-ci/typos@d43b6c087ac471e2ea7b8af622ff15f05c0c365b # v1.50.1
+        with:
+          files: src/content/docs src/content/partials src/content/changelog
+          config: ./_typos.toml
+
   pre-build:
     name: Pre Build
     runs-on: ubuntu-latest
@@ -25,7 +46,7 @@ jobs:
       - name: Set up pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with:
-          version: 11
+          version: 11.28.2
 
       - name: Set up node
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
@@ -60,22 +81,8 @@ jobs:
             exit 1
           fi
 
-      - name: Restore node_modules (cache hit)
-        id: node-modules-cache
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
-        with:
-          path: node_modules
-          key: node-modules-${{ runner.os }}-node-${{ steps.setup-node.outputs.node-version }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('package.json') }}
-
-      - name: Install node_modules (cache miss)
+      - name: Install dependencies
         run: pnpm install --frozen-lockfile
-        if: steps.node-modules-cache.outputs.cache-hit != 'true'
-
-      - name: Post codeowners comment
-        run: pnpm exec tsx bin/post-codeowners-comment/index.ts
-        continue-on-error: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Check Astro and CF Worker
         run: pnpm run check
@@ -111,10 +118,9 @@ jobs:
     needs: pre-build
     runs-on: ubuntu-latest
     outputs:
-      link_validation_failed: ${{ steps.build_step.outputs.link_validation_failed }}
+      succeeded: ${{ steps.build.outputs.succeeded }}
     permissions:
       contents: read
-      pull-requests: write
     steps:
       - name: Check out repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -124,7 +130,7 @@ jobs:
       - name: Set up pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with:
-          version: 11
+          version: 11.28.2
 
       - name: Set up node
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
@@ -133,34 +139,28 @@ jobs:
           node-version: 24.x
           cache: pnpm
 
-      - name: Restore node_modules (cache hit)
-        id: node-modules-cache
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
-        with:
-          path: node_modules
-          key: node-modules-${{ runner.os }}-node-${{ steps.setup-node.outputs.node-version }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('package.json') }}
-
-      - name: Install node_modules (cache miss)
+      - name: Install dependencies
         run: pnpm install --frozen-lockfile
-        if: steps.node-modules-cache.outputs.cache-hit != 'true'
 
-      - name: Restore Astro assets from cache
+      - name: Restore Astro cache
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
         with:
           path: |
-            .astro-cache/assets
-          key: astro-assets-${{ hashFiles('src/assets/**') }}
+            node_modules/.astro
+          key: astro-cache-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ github.event.pull_request.head.sha || github.sha }}
           restore-keys: |
-            astro-assets-
+            astro-cache-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}-
+            astro-cache-${{ runner.os }}-
 
       - name: Build
-        id: build_step
+        id: build
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RUN_LINK_CHECK: true
+          NODE_OPTIONS: "--max-old-space-size=8192"
         run: |
           set -o pipefail
-          pnpm run build 2>&1 | tee /tmp/build-output.log
+          pnpm run build 2>&1 | tee build.log
+          echo "succeeded=true" >> "$GITHUB_OUTPUT"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
@@ -168,12 +168,21 @@ jobs:
           name: dist
           path: dist
 
-      - name: Upload link validation report
-        if: steps.build_step.outputs.link_validation_failed == 'true'
+      - name: Upload Nimbus link data
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
-          name: link-validation-report
-          path: .starlight-links-validator/errors.json
+          name: nimbus
+          path: .nimbus
+          include-hidden-files: true
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
 
   post-build:
     name: Post Build
@@ -191,7 +200,7 @@ jobs:
       - name: Set up pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with:
-          version: 11
+          version: 11.28.2
 
       - name: Set up node
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
@@ -200,16 +209,8 @@ jobs:
           node-version: 24.x
           cache: pnpm
 
-      - name: Restore node_modules (cache hit)
-        id: node-modules-cache
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
-        with:
-          path: node_modules
-          key: node-modules-${{ runner.os }}-node-${{ steps.setup-node.outputs.node-version }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('package.json') }}
-
-      - name: Install node_modules (cache miss)
+      - name: Install dependencies
         run: pnpm install --frozen-lockfile
-        if: steps.node-modules-cache.outputs.cache-hit != 'true'
 
       - name: Download artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -220,19 +221,33 @@ jobs:
       - name: Tests (Workers)
         run: pnpm run test:postbuild
 
-      - name: Download link validation report
-        if: needs.build.outputs.link_validation_failed == 'true'
+      # Lint steps use `!cancelled()` so a lint failure doesn't skip the
+      # others. The report step is the gate: it prints the findings and fails.
+      - name: Download Nimbus link data
+        if: ${{ !cancelled() }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: link-validation-report
-          path: .starlight-links-validator
+          name: nimbus
+          path: .nimbus
 
-      - name: Link validation
-        run: pnpm exec tsx bin/check-link-validation/index.ts
+      - name: Run Nimbus lint
+        id: nimbus-lint
+        if: ${{ !cancelled() }}
+        run: |
+          set +e
+          pnpm exec nimbus-docs lint --format json > "$RUNNER_TEMP/nimbus-lint.json"
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Check internal links
+        if: ${{ !cancelled() }}
+        env:
+          LINT_EXIT_CODE: ${{ steps.nimbus-lint.outputs.exit_code }}
+        run: pnpm exec tsx bin/nimbus-lint-report.ts "$RUNNER_TEMP/nimbus-lint.json"
 
   notify:
     name: Notify
-    needs: [pre-build, build, post-build]
+    needs: [pre-build, post-build]
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -247,7 +262,7 @@ jobs:
       - name: Set up pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with:
-          version: 11
+          version: 11.28.2
 
       - name: Set up node
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
@@ -256,16 +271,8 @@ jobs:
           node-version: 24.x
           cache: pnpm
 
-      - name: Restore node_modules (cache hit)
-        id: node-modules-cache
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
-        with:
-          path: node_modules
-          key: node-modules-${{ runner.os }}-node-${{ steps.setup-node.outputs.node-version }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('package.json') }}
-
-      - name: Install node_modules (cache miss)
+      - name: Install dependencies
         run: pnpm install --frozen-lockfile
-        if: steps.node-modules-cache.outputs.cache-hit != 'true'
 
       - name: Post PR CI failure comment
         continue-on-error: true
@@ -273,24 +280,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: pnpm exec tsx bin/post-pr-ci-failure-comment/index.ts
 
-      - name: Download link validation report
-        if: needs.build.outputs.link_validation_failed == 'true' && github.event.pull_request.head.repo.full_name == github.repository
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: link-validation-report
-          path: .starlight-links-validator
-
-      - name: Post link validation comment
-        if: github.event.pull_request.head.repo.full_name == github.repository
-        continue-on-error: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: pnpm exec tsx bin/post-link-validation-comment/index.ts
-
   publish-preview:
     name: Deploy Preview
     needs: build
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event.pull_request.head.repo.full_name == github.repository && needs.build.outputs.succeeded == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -304,7 +297,7 @@ jobs:
       - name: Set up pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
         with:
-          version: 11
+          version: 11.28.2
 
       - name: Set up node
         uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
@@ -313,16 +306,8 @@ jobs:
           node-version: 24.x
           cache: pnpm
 
-      - name: Restore node_modules (cache hit)
-        id: node-modules-cache
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5
-        with:
-          path: node_modules
-          key: node-modules-${{ runner.os }}-node-${{ steps.setup-node.outputs.node-version }}-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('package.json') }}
-
-      - name: Install node_modules (cache miss)
+      - name: Install dependencies
         run: pnpm install --frozen-lockfile
-        if: steps.node-modules-cache.outputs.cache-hit != 'true'
 
       - name: Download artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -340,14 +325,24 @@ jobs:
           SHORT_SHA="${PR_HEAD_SHA:0:8}"
           BRANCH_SLUG=$(echo "$PR_HEAD_REF" | iconv -c -t ascii//TRANSLIT | sed -E 's/[~^]+//g' | sed -E 's/[^a-zA-Z0-9]+/-/g' | sed -E 's/^-+|-+$//g' | tr A-Z a-z)
 
-          echo "branch_slug=$BRANCH_SLUG" >> "$GITHUB_OUTPUT"
+          echo "branch_slug=${BRANCH_SLUG}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
 
-          pnpm exec wrangler deploy --dispatch-namespace preview-deployments --name $SHORT_SHA
-          pnpm exec wrangler deploy --dispatch-namespace preview-deployments --name $BRANCH_SLUG
+          # These two deploys are independent (different Worker names in the
+          # same dispatch namespace), so run them concurrently instead of
+          # back-to-back.
+          pnpm exec wrangler deploy --config wrangler.preview.json --dispatch-namespace preview-deployments --name "${SHORT_SHA}" &
+          short_sha_pid=$!
+          pnpm exec wrangler deploy --config wrangler.preview.json --dispatch-namespace preview-deployments --name "${BRANCH_SLUG}" &
+          branch_slug_pid=$!
+
+          wait "$short_sha_pid"
+          wait "$branch_slug_pid"
 
       - name: Post preview URL on PR
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH_SLUG: ${{ steps.deploy.outputs.branch_slug }}
+          SHORT_SHA: ${{ steps.deploy.outputs.short_sha }}
         run: pnpm exec tsx bin/post-preview-url-comment/index.ts
         continue-on-error: true
